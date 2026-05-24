@@ -324,6 +324,22 @@ curl -X POST https://api.textbubbles.com/v1/messages \
   }'
 ```
 
+## Attachments vs Media URLs — Which Field Do I Use?
+
+Text is optional when sending media. Every request must include at least one of `content.text` (non-empty), `content.mediaUrls`, or `attachments[]`. You can send an attachment-only message — voice note, image with no caption, etc. — by omitting `content.text` or passing an empty string. Sending a request with no text, no `mediaUrls`, and no `attachments[]` returns 400.
+
+| Use | Field | Channels | Source types | Notes |
+|-----|-------|----------|--------------|-------|
+| Send a file (photo, video, PDF, audio, any MIME type) | attachments[] | iMessage and SMS/MMS | type: "url" (HTTPS) or type: "base64" | Required for non-image files and for base64 payloads. On iMessage, 2+ items arrive as a grouped photo gallery delivered after the text bubble. On SMS, each attachment is delivered as a separate MMS; carrier delivery of non-image MIME types is not guaranteed. |
+| Send an image (or 2+ images as a carousel) | content.mediaUrls | iMessage and SMS/MMS | HTTPS image URLs only | On iMessage, 2+ URLs arrive as a single grouped carousel bubble with the text caption inlined. On SMS, the carrier fetches each URL and attaches it as MMS. |
+
+Decision tree:
+1. Need a non-image file (PDF, video, audio, vCard, etc.) or raw bytes (`type: "base64"`)? Use `attachments[]`. SMS/MMS cannot carry arbitrary file types in all carrier networks — check capabilities first.
+2. Want 2+ images to arrive as a single grouped bubble with the text caption inline? Use `content.mediaUrls`. Multiple `attachments[]` also arrives as a grouped gallery on iMessage, but the text is sent as a separate bubble before the gallery.
+3. Everything else (single image with an HTTPS URL): either works; prefer `attachments[]` for explicit control over `mimeType` and `filename`.
+
+Do not set both `attachments[]` and `content.mediaUrls` on the same request. If you do, `attachments[]` is sent on the iMessage path and `mediaUrls` is sent on the SMS path, producing different payloads depending on which channel the router picks — almost never what you want.
+
 ## With Attachments
 
 URL attachment (iMessage):
@@ -361,6 +377,33 @@ curl -X POST https://api.textbubbles.com/v1/messages \
     "routing": { "preference": ["sms"] }
   }'
 ```
+
+## Voice Memos
+
+To send an audio file as a native iMessage voice-memo bubble (inline player with waveform) instead of a generic file attachment, set `isAudioMessage: true` on the attachment. Voice memos are attachment-only — either omit `content.text` (send `"content": {}`) or pass `"text": ""`. Both are accepted.
+
+Accepted formats: any audio (MP3, Opus/AAC/PCM in CAF, webm, m4a, ogg, wav, …). The server normalizes non-compatible inputs to Opus-in-CAF — the format iMessage's voice-memo UI can read. If you can, encode client-side to Opus-in-CAF to skip the extra server transcode.
+
+```bash
+curl -X POST https://api.textbubbles.com/v1/messages \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "to": "+14155551234",
+    "content": {},
+    "attachments": [
+      {
+        "type": "url",
+        "url": "https://example.com/voicenote.caf",
+        "mimeType": "audio/x-caf",
+        "filename": "voicenote.caf",
+        "isAudioMessage": true
+      }
+    ]
+  }'
+```
+
+Without `isAudioMessage: true`, the audio file arrives as a generic file attachment that the recipient must tap to download.
 
 ## Base64 Attachments
 
@@ -423,8 +466,41 @@ By default, messages try iMessage first and fall back to SMS. Customize with the
 }
 ```
 
-- `preference` — ordered list of channels: "imessage", "sms"
+- `preference` — ordered list of channels: "imessage", "sms", "whatsapp"
 - `fallback` — try the next channel if the first fails (default: true)
+
+Webhook event reliability varies by channel. SMS in particular does not emit `message.read`, only emits `message.delivered` on a best-effort basis (depends on the carrier returning a receipt), and SMS "reactions" arrive as plain `message.inbound` text rather than `message.reaction`. See the Per-Channel Reliability matrix below before relying on a specific event for a given channel.
+
+### WhatsApp Routing
+
+Include `"whatsapp"` in the preference list. The WhatsApp send uses the same phone number as your iMessage/SMS line — pairing is per-number and managed via the admin panel or the `/v1/whatsapp/**` API.
+
+```json
+{
+  "to": "+14155551234",
+  "content": { "text": "Hello from WhatsApp!" },
+  "routing": { "preference": ["whatsapp"] }
+}
+```
+
+Fall back from WhatsApp to iMessage/SMS:
+
+```json
+{ "routing": { "preference": ["whatsapp", "imessage", "sms"] } }
+```
+
+Send to an existing WhatsApp group by passing the group JID as `to`:
+
+```json
+{
+  "to": "120363012345678901@g.us",
+  "content": { "text": "Hi team" },
+  "routing": { "preference": ["whatsapp"] },
+  "mentions": [{ "address": "+14155551234", "start": 0, "length": 3 }]
+}
+```
+
+Mentions are honoured on group sends only and silently dropped on individual chats. iMessage-only fields (`effect`, `messageType: "carousel"`) are dropped on a WhatsApp send.
 
 ## Unsend a Message
 
@@ -531,7 +607,7 @@ Every request must include at least one of `content.text` (non-empty), `content.
 | from | string | No | Sender address (must be authorized; uses default if omitted) |
 | content.text | string | No | Message text (up to 10,000 chars). Optional if content.mediaUrls or attachments[] is provided. May be omitted or empty for attachment-only messages (voice notes, images with no caption). |
 | content.mediaUrls | string[] | No | Array of 1-20 HTTPS image URLs. When 2+ URLs are provided, sends as an image carousel |
-| routing.preference | string[] | No | Channel priority (default: ["imessage", "sms"]) |
+| routing.preference | string[] | No | Channel priority (default: ["imessage", "sms"]). Allowed values: "imessage", "sms", "whatsapp" |
 | routing.fallback | boolean | No | Enable fallback (default: true) |
 | replyTo | string | No | Message ID to reply to (iMessage only) |
 | attachments | object[] | No | File attachments. iMessage and SMS/MMS; on SMS each attachment is delivered as a separate MMS, carrier-dependent for non-image MIME types. |
@@ -706,7 +782,9 @@ Only messages with status "scheduled" can be cancelled.
 
 # Tapback Reactions
 
-Send emoji reactions to messages via POST /v1/messages/:id/reactions. iMessage only.
+Send emoji reactions to messages via POST /v1/messages/:id/reactions. Tapbacks are an iMessage-only feature; reactions on WhatsApp use the same endpoint but map differently (see WhatsApp section).
+
+The `:id` in the URL is the internal TextBubbles message ID (e.g. `msg_abc123`) — not the provider GUID. For outbound messages this is the ID returned from POST /v1/messages. For inbound messages received via the `message.inbound` webhook, use the `messageId` field in the webhook payload (not `externalMessageId`).
 
 ```bash
 curl -X POST https://api.textbubbles.com/v1/messages/msg_abc123/reactions \
@@ -732,12 +810,12 @@ Response:
 
 | Type | Emoji | Description |
 |------|-------|-------------|
-| love | heart | Heart |
-| like | thumbs up | Thumbs up |
-| dislike | thumbs down | Thumbs down |
-| laugh | laughing | Laughing |
-| emphasize | exclamation marks | Exclamation marks |
-| question | question mark | Question mark |
+| love | ❤️ | Heart |
+| like | 👍 | Thumbs up |
+| dislike | 👎 | Thumbs down |
+| laugh | 😂 | Laughing |
+| emphasize | ‼️ | Exclamation marks |
+| question | ❓ | Question mark |
 
 ## Remove a Reaction
 
@@ -764,17 +842,9 @@ Notes:
 
 Add visual effects to iMessage messages using the `effect` field. Effects are silently ignored if the message falls back to SMS.
 
-## Screen Effects
-
-| Effect | Description |
-|--------|-------------|
-| fireworks | Fireworks burst across the screen |
-| balloons | Colorful balloons float up |
-| confetti | Confetti rains down |
-| lasers | Laser light show |
-| spotlight | Spotlight highlights the message |
-
 ## Bubble Effects
+
+Bubble effects apply to the message bubble itself.
 
 | Effect | Description |
 |--------|-------------|
@@ -782,8 +852,20 @@ Add visual effects to iMessage messages using the `effect` field. Effects are si
 | loud | Message appears large and shakes |
 | gentle | Message fades in softly |
 | invisibleInk | Message is hidden until swiped |
-| echo | Message echoes across the screen |
-| love | Heart animation on the message bubble |
+
+## Screen Effects
+
+Screen effects animate the entire conversation view.
+
+| Effect | Description |
+|--------|-------------|
+| echo | Message echoes across the screen in copies |
+| spotlight | Spotlight highlights the message |
+| balloons | Colorful balloons float up |
+| confetti | Confetti rains down |
+| love | Giant heart animation |
+| lasers | Laser light show |
+| fireworks | Fireworks burst across the screen |
 
 ---
 
@@ -941,10 +1023,38 @@ Every webhook delivery also carries:
 ### Verification Steps
 
 1. Extract the timestamp and signature from the headers
-2. Construct the signed payload: `{timestamp}.{raw_request_body}`
-3. Compute HMAC-SHA256 using your webhook secret
-4. Compare signatures using constant-time comparison
-5. Reject requests older than 5 minutes to prevent replay attacks
+2. Read the exact raw request body bytes — do NOT parse and re-serialize JSON, as key order or whitespace differences will break the signature
+3. Construct the signed payload string: `{timestamp}.{raw_request_body}` (a literal `.` between the timestamp and body)
+4. Compute `HMAC-SHA256(secret, signedPayload)` and hex-encode the digest
+5. Prepend `sha256=` and compare to `X-Signature` using constant-time comparison
+6. Reject requests where `|now - timestamp| > 300` seconds to prevent replay attacks
+
+### Algorithm Reference
+
+```
+signedPayload = timestamp + "." + rawRequestBody
+expected      = "sha256=" + lowerHex(HMAC_SHA256(secret, signedPayload))
+valid         = constantTimeEqual(expected, X-Signature) AND abs(now - timestamp) <= 300
+```
+
+### Unit Test Fixture
+
+Use this known-good fixture to verify your implementation. If your code produces the expected signature below, your verifier is correct.
+
+| Field | Value |
+|-------|-------|
+| secret | `whsec_test_secret_do_not_use_in_production` |
+| X-Timestamp | `1774699203` |
+| Raw body | `{"id":"evt_550e8400-e29b-41d4-a716-446655440000","type":"message.delivered","timestamp":"2026-03-28T10:00:03.000Z","data":{"messageId":"msg_xyz","externalMessageId":"external-guid","from":"+19876543210","to":"+14155551234","text":"Hello!","channel":"imessage","status":"delivered"}}` |
+| Expected X-Signature | `sha256=d055c034071c12e906654f864c1e5a03fbdea2399444cdf4448f35bf81218977` |
+
+### Common Verification Pitfalls
+
+- Re-serializing parsed JSON. `JSON.stringify(req.body)` or `json.dumps(request.json())` will almost never reproduce the exact bytes the API signed. Always verify against the raw body.
+- Wrong separator. The signed string is `{timestamp}.{body}` — a literal ASCII period between timestamp and body, with no spaces.
+- Millisecond vs second timestamp. `X-Timestamp` is Unix seconds. Dividing `Date.now()` by 1000 and flooring gives the right unit.
+- Forgetting the `sha256=` prefix in the comparison string.
+- Using the wrong webhook's secret. If you register multiple webhooks that point at different endpoints, each one has its own secret. Verify each endpoint using the secret you received when creating (or rotating) that specific webhook.
 
 ### Node.js Example
 
@@ -1103,9 +1213,37 @@ Every webhook event follows this structure:
 | message.edited | Message was successfully edited (iMessage only) |
 | message.edit_failed | Message edit failed (iMessage only) |
 | message.deleted | Message was soft-deleted |
-| typing.indicator | Recipient is typing (WhatsApp only) |
+| typing.indicator | Recipient is typing (WhatsApp only — see Typing Indicator section) |
+| whatsapp.status | WhatsApp session changed pairing state (`qr_pending` / `connecting` / `connected` / `disconnected`). Realtime-only — not sent to webhook URLs; subscribe via the Realtime/SSE stream |
 
-### Per-Channel Reliability
+## Status Event Payloads
+
+Delivery-status events (`message.sent`, `message.delivered`, `message.read`, `message.failed`, etc.) all share the same shape:
+
+```json
+{
+  "id": "evt_abc123",
+  "type": "message.read",
+  "timestamp": "2026-03-28T10:00:07.000Z",
+  "data": {
+    "messageId": "msg_xyz789",
+    "externalMessageId": "AB12CD34-5678-90EF-1234-567890ABCDEF",
+    "channel": "imessage",
+    "readAt": "2026-03-28T10:00:07.000Z"
+  }
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| messageId | Internal TextBubbles message ID |
+| externalMessageId | Provider-level GUID |
+| channel | `imessage`, `sms`, or `whatsapp` |
+| readAt | ISO-8601 timestamp (present on `message.read` only) |
+
+`message.read` fires for iMessage and WhatsApp when the recipient has read receipts enabled on their device. It is a distinct event from `message.delivered` — do not collapse them when tracking delivery state. SMS does not emit `message.read`.
+
+## Per-Channel Reliability
 
 Not every event fires for every channel. Use this matrix when branching on channel — do not assume parity.
 
@@ -1204,10 +1342,12 @@ Fired when an incoming FaceTime call is detected on an instance.
   "timestamp": "2026-03-28T10:00:00.000Z",
   "data": {
     "messageId": "msg_xyz789",
+    "externalMessageId": "AB12CD34-5678-90EF-1234-567890ABCDEF",
     "from": "+14155551234",
     "to": "+19876543210",
     "text": "Check out this photo",
     "channel": "imessage",
+    "parentMessageId": null,
     "attachments": [
       {
         "guid": "att_550e8400-e29b-41d4-a716-446655440000",
@@ -1225,11 +1365,14 @@ Fired when an incoming FaceTime call is detected on an instance.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| messageId | string | Unique message identifier |
-| from | string | Sender's phone number (E.164) or email |
+| messageId | string | Internal TextBubbles message ID. Use this when calling endpoints like `POST /v1/messages/:id/reactions` or `PUT /v1/messages/:id` in response to the inbound message |
+| externalMessageId | string | Provider-level identifier (iMessage GUID or WhatsApp message id) — use for correlating with provider logs |
+| from | string | Sender's phone number in E.164 (or email for iMessage email addresses). For WhatsApp senders on WA's LID privacy mode, TextBubbles resolves the LID to the real E.164 number before emitting the webhook |
 | to | string | Receiving phone number or email (identifies which instance received the message) |
 | text | string | Message text content |
-| channel | string | Channel the message was received on (imessage, sms, or whatsapp) |
+| channel | string | Channel the message was received on: `imessage`, `sms`, or `whatsapp` |
+| parentMessageId | string \| null | Internal `messageId` this inbound is replying to. Set for iMessage thread replies and WhatsApp quoted replies — a consumer that reads only `parentMessageId` works on both channels |
+| replyTo | object \| absent | WhatsApp only. Provider-level detail about the quoted parent — same internal `messageId` as `parentMessageId`, plus the WhatsApp `externalMessageId` for correlating with WA-indexed stores. Omit if the inbound was not a quoted reply |
 | attachments | array | List of file attachments (empty array if none). Same shape across all channels — your inbox code does not need to branch on `channel` to fetch media |
 | attachments[].guid | string \| undefined | Unique identifier for the attachment. Present for iMessage; omitted on other channels |
 | attachments[].mimeType | string | MIME type (e.g., image/jpeg, video/mp4, audio/aac) |
@@ -1237,6 +1380,90 @@ Fired when an incoming FaceTime call is detected on an instance.
 | attachments[].totalBytes | number | File size in bytes |
 | attachments[].downloadUrl | string | Pre-signed URL (1 hour TTL, no API key required) |
 | attachments[].note | string \| undefined | Present only on rare failure cases when the attachment metadata reached the platform but the bytes couldn't be persisted. When present, `downloadUrl` will be absent |
+| otp | object \| absent | Present when TextBubbles detected a 2FA / verification code in the inbound body (WhatsApp signup, bank OTP, etc.). See OTP detection on inbound messages below |
+
+Replying to inbound messages: always use `messageId` (internal), not `externalMessageId`, when invoking TextBubbles API endpoints. For example, to react to the inbound message above, `POST /v1/messages/msg_xyz789/reactions`.
+
+### Example: WhatsApp quoted reply
+
+When a contact quote-replies to a message you sent, the webhook surfaces the parent reference so you don't need to index `externalMessageId`s yourself:
+
+```json
+{
+  "id": "evt_abc123",
+  "type": "message.inbound",
+  "timestamp": "2026-04-20T20:44:43.000Z",
+  "data": {
+    "messageId": "msg_cad993d1-13f4-47e5-af60-b926d142e8f9",
+    "externalMessageId": "3A7D053CB47169B2734B",
+    "from": "+14155551234",
+    "to": "+16282895642",
+    "text": "Reply",
+    "channel": "whatsapp",
+    "customerId": "4b02f4ab-35d9-444a-b0ee-4c2a3edd347c",
+    "replyTo": {
+      "messageId": "msg_6d8ef255-7e5a-40ad-8cc2-4816cf9b039d",
+      "externalMessageId": "3EB0E921E1F353BB23A1B8"
+    }
+  }
+}
+```
+
+## Typing Indicator
+
+WhatsApp contacts emit a typing event while composing a message. The webhook surfaces each emission as a single `typing.indicator` event. WhatsApp does NOT emit a corresponding "stopped typing" event — the stream simply goes quiet.
+
+```json
+{
+  "id": "evt_abc123",
+  "type": "typing.indicator",
+  "timestamp": "2026-04-20T20:31:16.000Z",
+  "data": {
+    "state": "composing",
+    "from": "+14155551234",
+    "channel": "whatsapp",
+    "customerId": "4b02f4ab-35d9-444a-b0ee-4c2a3edd347c"
+  }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| state | string | Always `"composing"` today. Future states (`paused`, etc.) may be added |
+| from | string | E.164 phone number of the contact who is typing |
+| channel | string | Always `"whatsapp"` — iMessage typing indicators are not surfaced as webhooks |
+| customerId | string | Customer the event belongs to |
+
+Recommended consumer behavior: treat each `typing.indicator` event as "show a typing bubble for ~5 seconds." WhatsApp re-emits the event every few seconds while the contact keeps typing, so the bubble stays on as long as they continue. When emissions stop, the bubble times out naturally.
+
+## WhatsApp Session Status
+
+`whatsapp.status` fires every time a WhatsApp session's pairing state changes — useful for driving a live pairing UI without polling `GET /v1/whatsapp/numbers/:phoneNumber/status`. Delivered on the Realtime/SSE stream only (not to webhook URLs).
+
+```json
+{
+  "id": "evt_abc123",
+  "type": "whatsapp.status",
+  "timestamp": "2026-04-20T20:40:00.000Z",
+  "data": {
+    "phoneNumber": "+16282895642",
+    "status": "connected",
+    "jid": "16282895642:2@s.whatsapp.net",
+    "customerId": "4b02f4ab-35d9-444a-b0ee-4c2a3edd347c"
+  }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| phoneNumber | string | The TextBubbles number whose session changed |
+| status | string | `qr_pending` / `connecting` / `connected` / `disconnected` |
+| qrCode | string \| null | Present when `status` is `qr_pending` — raw QR string, render with any library |
+| jid | string \| null | Present when `status` is `connected` — the paired WhatsApp JID (usually `<phone>:<device>@s.whatsapp.net`) |
+| disconnectReason | string \| null | Present when `status` is `disconnected` — `auth_revoked`, `phone_number_mismatch`, or `close_<code>` |
+| customerId | string | Customer the session belongs to |
+
+Subscribe from the textbubbles UI or from any SSE-capable client via `GET /v1/events?events=whatsapp.status`.
 
 ## Reaction Events
 
@@ -1282,11 +1509,11 @@ Emoji reactions (iOS 17+):
 
 | Field | Description |
 |-------|-------------|
-| reaction.type | love, like, dislike, laugh, emphasize, question, emoji, remove |
-| reaction.emoji | Emoji character (only when type is "emoji") |
-| reaction.targetMessageId | Internal message ID (null if not found) |
-| reaction.targetExternalId | Provider-assigned GUID of original message |
-| reaction.content | Human-readable description (null for emoji) |
+| reaction.type | Reaction type. iMessage: `love`, `like`, `dislike`, `laugh`, `emphasize`, `question`, `emoji`, `remove`. WhatsApp: the raw emoji character (e.g. `❤️`, `🔥`), or the literal string `"removed"` when the reaction was cleared |
+| reaction.emoji | The emoji character. Present on iMessage when `type` is `emoji` (iOS 17+), and on WhatsApp whenever a non-empty emoji was sent |
+| reaction.targetMessageId | Internal `messageId` the reaction was applied to (null if not found) |
+| reaction.targetExternalId | Provider-assigned GUID of the original message |
+| reaction.content | Human-readable description or preview of the target message text (null for emoji-only reactions on iMessage) |
 
 ## Audio Kept Events
 
@@ -1533,12 +1760,27 @@ Top-level status is "ok" when database and Redis are reachable, "degraded" if ei
 
 ## Instance Health Statuses
 
+Each iMessage provider instance is independently monitored every 2 minutes. Instance health is stored as one of four values:
+
 | Status | Meaning |
 |--------|---------|
 | healthy | Instance is reachable and fully functional |
-| degraded | Instance is reachable but has issues |
+| degraded | Instance is reachable but has issues (see warnings below) |
 | unhealthy | Instance is unreachable or health check failed |
 | unknown | Instance has not been checked yet |
+
+## Instance Health Warnings
+
+When an instance has `degraded` status, the response includes an array of warning strings describing what is wrong. The following conditions trigger warnings:
+
+| Condition | Warning | Impact |
+|-----------|---------|--------|
+| Private API disabled | "Private API is disabled" | Typing indicators, reactions, read receipts, and FaceTime events will not work |
+| Private API helper disconnected | "Private API helper is not connected" | Same features as above are unavailable; requires operator intervention to resolve |
+| No iMessage account detected | "No iMessage account detected" | iMessage and FaceTime will not work on this instance |
+| No iCloud account detected | "No iCloud account detected" | iMessage and FaceTime will not work on this instance; requires operator intervention to resolve |
+
+An instance can have multiple warnings at the same time. Warnings are cleared automatically when the next health check finds the condition resolved.
 
 ---
 
@@ -1565,6 +1807,9 @@ Top-level status is "ok" when database and Redis are reachable, "degraded" if ei
 | MISSING_EXTERNAL_ID | 400 | Message has no external provider ID |
 | ALREADY_UNSENT | 409 | Message already unsent |
 | ALREADY_DELETED | 409 | Message already deleted |
+| WEBHOOK_NOT_FOUND | 404 | Webhook does not exist or does not belong to your customer |
+| WEBHOOK_DUPLICATE | 409 | A webhook with this URL and event set already exists |
+| WEBHOOK_NOT_CONFIGURED | 404 | No webhook registered (legacy single-webhook endpoints only) |
 | NOT_SCHEDULED | 400 | Message is not in scheduled status |
 | INVALID_SCHEDULED_AT | 400 | Invalid ISO 8601 datetime format |
 | SCHEDULED_IN_PAST | 400 | Scheduled time is in the past |
