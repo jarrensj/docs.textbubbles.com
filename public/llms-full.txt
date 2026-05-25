@@ -274,7 +274,7 @@ curl -X POST https://api.textbubbles.com/v1/messages \
   }'
 ```
 
-The `to` field accepts phone numbers in E.164 format (e.g., `+14155551234`) or iMessage email addresses (e.g., `user@example.com`).
+The `to` field accepts phone numbers in E.164 format (e.g., `+14155551234`) or iMessage email addresses (e.g., `user@example.com`). To send into an existing chat instead, pass `chatId` (a conversation UUID) — see "Sending to a Chat" below.
 
 ## Sender Address (from)
 
@@ -582,22 +582,42 @@ Include an `idempotencyKey` to prevent duplicate sends during retries:
 
 If a message with the same key already exists, the API returns 200 OK with the existing message.
 
-## Group Chats — POST /v1/messages with conversationId
+## Sending to a Chat — POST /v1/messages with chatId
 
-Send into an existing group chat (or any pinned conversation) by passing `conversationId` instead of `to`. The `conversationId` is returned from `POST /v1/chats/groups`. Exactly one of `to` or `conversationId` must be provided.
+Send into an existing chat (group or 1:1) by passing `chatId` instead of `to`. The `chatId` value is the `conversationId` UUID returned from `POST /v1/chats/groups` or `GET /v1/chats/:chatId`. Exactly one of `to` or `chatId` must be provided.
 
 ```bash
 curl -X POST https://api.textbubbles.com/v1/messages \
   -H "Authorization: Bearer YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "conversationId": "550e8400-e29b-41d4-a716-446655440000",
+    "chatId": "550e8400-e29b-41d4-a716-446655440000",
     "content": { "text": "Hey team" }
   }'
 ```
 
-When `conversationId` is used:
-- The channel is pinned to whatever the conversation was created on; `routing` and `fallback` are ignored.
+Response (202 Accepted):
+
+```json
+{
+  "success": true,
+  "data": {
+    "id": "msg_abc123",
+    "status": "queued",
+    "conversationId": "550e8400-e29b-41d4-a716-446655440000",
+    "from": "+14155551234",
+    "createdAt": "2026-05-25T10:00:00.000Z"
+  },
+  "requestId": "req_abc123"
+}
+```
+
+When `chatId` is used:
+- The 202 response carries `conversationId` (same UUID) in place of `to`.
+- The channel and sender instance are pinned to the chat; `routing.preference` and `routing.fallback` are ignored.
+- If `from` is supplied, it must resolve to the chat's pinned instance — a mismatch returns 400 FROM_INSTANCE_CANNOT_REACH.
+- An unknown or foreign `chatId` returns 404 CONVERSATION_NOT_FOUND.
+- Supplying both `to` and `chatId`, or neither, returns 400 INVALID_REQUEST.
 - Group send on SMS is not supported; returns 400 GROUP_SMS_UNSUPPORTED.
 - `createContact` is ignored (no single recipient).
 
@@ -610,7 +630,7 @@ curl -X POST https://api.textbubbles.com/v1/chats/groups \
   -d '{ "participants": ["+14155551234", "+14155559876"], "name": "Launch Team" }'
 ```
 
-Response data: `{ chatId, conversationId, participants, name, createdAt }`. Use `conversationId` for sends; `chatId` for chat-level endpoints (rename, add/remove participant, leave).
+Response data: `{ chatId, conversationId, participants, name, createdAt }`. Use `conversationId` as the `chatId` field value on `POST /v1/messages`; use `chatId` (provider GUID) on chat-level endpoints (rename, add/remove participant, leave).
 
 ## Full Request Schema — POST /v1/messages
 
@@ -618,9 +638,9 @@ Every request must include at least one of `content.text` (non-empty), `content.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| to | string | Conditionally | Recipient phone number (E.164) or iMessage email address. Required unless conversationId is provided. |
-| conversationId | string | Conditionally | UUID of an existing conversation for group or pinned sends. Required unless to is provided. |
-| from | string | No | Sender address (must be authorized; uses default if omitted) |
+| to | string | Conditionally | Recipient phone number (E.164) or iMessage email address. Required unless chatId is provided; mutually exclusive with chatId. |
+| chatId | string (UUID) | Conditionally | Conversation UUID (the `conversationId` from POST /v1/chats/groups). Sends into the existing chat; channel and instance are pinned. Required unless to is provided; mutually exclusive with to. |
+| from | string | No | Sender address (must be authorized; uses default if omitted). When chatId is supplied, must resolve to the chat's pinned instance. |
 | content.text | string | No | Message text (up to 10,000 chars). Optional if content.mediaUrls or attachments[] is provided. May be omitted or empty for attachment-only messages (voice notes, images with no caption). |
 | content.mediaUrls | string[] | No | Array of 1-20 HTTPS image URLs. When 2+ URLs are provided, sends as an image carousel |
 | routing.preference | string[] | No | Channel priority (default: ["imessage", "sms"]). Allowed values: "imessage", "sms", "whatsapp" |
@@ -1281,14 +1301,16 @@ Notes:
 
 ## Chat Events
 
-Fired when a contact performs a chat-state action (iMessage group chats).
+Fired when a chat-state action occurs on an iMessage or WhatsApp group chat.
 
 | Event | Description |
 |-------|-------------|
 | chat.participant.added | Participant added to a group chat |
 | chat.participant.left | Participant removed from (or left) a group chat |
 | chat.title.changed | Group chat title set or changed |
-| chat.photo.changed | Group chat photo updated |
+| chat.photo.changed | Group chat photo updated (iMessage only) |
+
+Single-emit dedup: when a customer initiates a rename / add / remove via /v1/chats/* AND the upstream provider fires its own state-change event for the same change, the corresponding webhook (chat.title.changed / chat.participant.added / chat.participant.left) is emitted exactly once. Dedup window is 60 seconds. Implement handlers to be idempotent on `eventId` regardless.
 
 ## Scheduled Message Events
 
@@ -1397,8 +1419,95 @@ Fired when an incoming FaceTime call is detected on an instance.
 | attachments[].downloadUrl | string | Pre-signed URL (1 hour TTL, no API key required) |
 | attachments[].note | string \| undefined | Present only on rare failure cases when the attachment metadata reached the platform but the bytes couldn't be persisted. When present, `downloadUrl` will be absent |
 | otp | object \| absent | Present when TextBubbles detected a 2FA / verification code in the inbound body (WhatsApp signup, bank OTP, etc.). See OTP detection on inbound messages below |
+| conversation | object \| absent | Present when the inbound was attributed to a known chat. See Conversation and sender fragments below |
+| sender | object \| absent | Present alongside `conversation`. Resolves the sender to a contact when one matches |
 
 Replying to inbound messages: always use `messageId` (internal), not `externalMessageId`, when invoking TextBubbles API endpoints. For example, to react to the inbound message above, `POST /v1/messages/msg_xyz789/reactions`.
+
+### Conversation and sender fragments
+
+`message.inbound` and outbound lifecycle events (`message.sent`, `message.delivered`, `message.read`, `message.failed`) include `conversation` and `sender` objects when the message is attributed to a known chat. Top-level `from`/`to` remain populated for backwards compatibility.
+
+1:1 inbound:
+
+```json
+{
+  "id": "evt_abc123",
+  "type": "message.inbound",
+  "timestamp": "2026-04-21T10:00:00.000Z",
+  "data": {
+    "messageId": "msg_xyz789",
+    "externalMessageId": "AB12CD34-5678-90EF-1234-567890ABCDEF",
+    "from": "+14155551234",
+    "to": "+19876543210",
+    "text": "Hey",
+    "channel": "imessage",
+    "conversation": {
+      "id": "550e8400-e29b-41d4-a716-446655440000",
+      "isGroup": false,
+      "providerChatGuid": "iMessage;-;+14155551234",
+      "channel": "imessage"
+    },
+    "sender": {
+      "contactId": "9e1c8f63-1c7d-4a4b-b9a3-2f31b3a72e10",
+      "handle": "+14155551234"
+    }
+  }
+}
+```
+
+Group inbound:
+
+```json
+{
+  "id": "evt_def456",
+  "type": "message.inbound",
+  "timestamp": "2026-04-21T10:05:00.000Z",
+  "data": {
+    "messageId": "msg_abc999",
+    "externalMessageId": "11AA22BB-3344-5566-7788-99AABBCCDDEE",
+    "from": "+14155551234",
+    "to": "+19876543210",
+    "text": "Anyone free Saturday?",
+    "channel": "imessage",
+    "conversation": {
+      "id": "660e8400-e29b-41d4-a716-446655440000",
+      "isGroup": true,
+      "providerChatGuid": "iMessage;+;chat1234567890",
+      "channel": "imessage",
+      "groupName": "Family Chat",
+      "participants": [
+        { "handle": "+14155551234", "contactId": "9e1c8f63-1c7d-4a4b-b9a3-2f31b3a72e10", "role": "member" },
+        { "handle": "+14155559876", "contactId": null, "role": "member" }
+      ]
+    },
+    "sender": {
+      "contactId": "9e1c8f63-1c7d-4a4b-b9a3-2f31b3a72e10",
+      "handle": "+14155551234"
+    }
+  }
+}
+```
+
+`conversation` fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| id | string | Stable UUID for the conversation. Use this in any future chat-keyed call |
+| isGroup | boolean | true for group chats, false for 1:1 |
+| providerChatGuid | string \| null | Provider chat identifier (same `chatId` returned by POST /v1/chats/groups and surfaced on chat.* events) |
+| channel | string | imessage, sms, or whatsapp |
+| groupName | string \| null \| absent | Group display name. Present only when isGroup is true; null if the group has no name set |
+| participants | array \| absent | Active roster. Present only when isGroup is true. Each entry: { handle, contactId, role, isPhoneResolved? }. `role` is `member`, `owner`, or `self`. `isPhoneResolved` is included on WhatsApp groups — true when `handle` is phone-based, false when `handle` is a Linked Device ID (`@lid`). Branch on `isPhoneResolved`, not on the suffix of `handle` |
+
+`sender` fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| contactId | string \| null | UUID of the matching contact when the sender's address resolves to a contact owned by the customer; null otherwise |
+| handle | string \| null | The sender's address as the provider supplied it (E.164 phone number for SMS/WhatsApp, phone or Apple ID for iMessage) |
+
+Outbound lifecycle events (`message.sent`, `message.delivered`, `message.read`, `message.failed`) include the same `conversation` and `sender` objects when the originating outbound message was associated with a conversation. Status events for legacy outbound messages without a stored conversation omit both fields.
 
 ### Example: WhatsApp quoted reply
 
@@ -1561,7 +1670,7 @@ Fired when a contact taps "Keep" on a voice note you sent. iMessage auto-deletes
 
 ## Chat Event Payloads
 
-All four chat events share the same envelope: `externalMessageId` (provider-assigned GUID of the underlying system event), `chatId` (provider chat identifier), `actor` (who performed the action), `to` (instance phone), `channel: "imessage"`.
+All chat events share the same envelope: `externalMessageId` (provider-assigned GUID of the underlying system event), `chatId` (provider chat identifier — `iMessage;+;<guid>` or `<id>@g.us`), `actor` (who performed the action), `to` (instance phone), `channel` ("imessage" or "whatsapp"). On WhatsApp, `participant` and `actor` may be JIDs and may end in `@lid` when the phone is not yet resolved.
 
 ### chat.participant.added / chat.participant.left
 
@@ -1628,6 +1737,210 @@ All four chat events share the same envelope: `externalMessageId` (provider-assi
 ```
 
 The event does not include the new photo — retrieve it through the chat resource.
+
+---
+
+# Chats
+
+Manage iMessage and WhatsApp group chats and per-chat state. The `chatId` path parameter is the provider chat identifier returned from POST /v1/chats/groups and surfaced on chat.* webhook events — `iMessage;+;<guid>` for iMessage chats, `<id>@g.us` for WhatsApp groups. Persisted chat rows surface a channel-independent UUID `conversationId` alongside `chatId` on the create and get endpoints; that UUID is what `POST /v1/messages` accepts to send into an existing chat.
+
+Channel asymmetry: POST /v1/chats/:chatId/read and POST /v1/chats/:chatId/unread are iMessage-only. They return 400 CHANNEL_NOT_SUPPORTED on WhatsApp chats — WhatsApp has no chat-level read ack. All other routes (GET, PUT /name, POST/DELETE /participants, POST /leave, POST /typing) work on both channels.
+
+## POST /v1/chats/groups
+
+Create a new group chat. Defaults to iMessage; pass `channel: "whatsapp"` to create a WhatsApp group.
+
+```bash
+curl -X POST https://api.textbubbles.com/v1/chats/groups \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{ "participants": ["+14155551234", "+14155559876"], "name": "Launch Team" }'
+```
+
+WhatsApp variant:
+
+```bash
+curl -X POST https://api.textbubbles.com/v1/chats/groups \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{ "channel": "whatsapp", "name": "Launch Team", "participants": ["+14155551234", "+14155559876"] }'
+```
+
+Body:
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| participants | string[] | Yes | One or more phone numbers (E.164). iMessage also accepts Apple IDs. WhatsApp normalizes to JID server-side |
+| name | string | Conditional | Required when channel is "whatsapp" (returns 400 NAME_REQUIRED if omitted). Optional for iMessage |
+| channel | string | No | "imessage" (default) or "whatsapp" |
+| from | string | No | Sender address (E.164). When supplied, the group is created from that specific instance and pinned to it; otherwise the customer's default instance for the chosen channel is used |
+
+Response (201) — iMessage:
+
+```json
+{
+  "success": true,
+  "data": {
+    "chatId": "iMessage;+;chat1234567890",
+    "conversationId": "550e8400-e29b-41d4-a716-446655440000",
+    "participants": ["+14155551234", "+14155559876"],
+    "name": "Launch Team",
+    "createdAt": "2026-04-21T10:00:00.000Z"
+  }
+}
+```
+
+Response (201) — WhatsApp:
+
+```json
+{
+  "success": true,
+  "data": {
+    "chatId": "120363025123456789@g.us",
+    "conversationId": "550e8400-e29b-41d4-a716-446655440000",
+    "channel": "whatsapp",
+    "participants": [
+      { "handle": "14155551234@s.whatsapp.net", "isPhoneResolved": true, "admin": null }
+    ],
+    "name": "Launch Team",
+    "createdAt": "2026-05-25T17:00:00.000Z"
+  }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| chatId | string | Provider chat identifier. iMessage: `iMessage;+;<guid>`. WhatsApp: `<id>@g.us` |
+| conversationId | string \| undefined | UUID of the persisted conversation row. Channel-independent. Omitted if persistence failed |
+| channel | string | "imessage" or "whatsapp". Present on WhatsApp responses |
+| participants | string[] \| object[] | iMessage: plain strings. WhatsApp: `{ handle, isPhoneResolved, admin }` |
+| name | string \| undefined | Display name |
+| createdAt | string | ISO-8601 creation timestamp |
+
+## GET /v1/chats/:chatId
+
+Retrieve metadata for a specific chat.
+
+```bash
+curl https://api.textbubbles.com/v1/chats/iMessage%3B%2B%3Bchat1234567890 \
+  -H "Authorization: Bearer YOUR_API_KEY"
+```
+
+URL-encode `chatId`; it contains `;` characters.
+
+Response (200):
+
+```json
+{
+  "success": true,
+  "data": {
+    "chatId": "iMessage;+;chat1234567890",
+    "conversationId": "550e8400-e29b-41d4-a716-446655440000",
+    "participants": ["+14155551234", "+14155559876"],
+    "name": "Launch Team",
+    "isGroup": true
+  }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| chatId | string | Provider chat identifier (`iMessage;+;<guid>` or `<id>@g.us`) |
+| conversationId | string \| undefined | UUID of the persisted conversation row |
+| channel | string | "imessage" or "whatsapp" (present on WhatsApp responses) |
+| participants | string[] \| object[] | iMessage: plain strings. WhatsApp: `{ handle, isPhoneResolved, admin }` |
+| name | string \| undefined | Display name (groups only) |
+| isGroup | boolean | true for groups, false for 1:1 |
+
+## PUT /v1/chats/:chatId/name
+
+Rename a group chat. Works on both channels. Fires `chat.title.changed`.
+
+```bash
+curl -X PUT https://api.textbubbles.com/v1/chats/iMessage%3B%2B%3Bchat1234567890/name \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{ "name": "Weekend plans" }'
+```
+
+Body: `{ "name": string }` (min length 1).
+
+Response: `{ "success": true, "data": { "chatId": "...", "name": "Weekend plans" } }`.
+
+## POST /v1/chats/:chatId/participants
+
+Add a single participant. Fires `chat.participant.added`.
+
+```bash
+curl -X POST https://api.textbubbles.com/v1/chats/iMessage%3B%2B%3Bchat1234567890/participants \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{ "participant": "+14155550100" }'
+```
+
+Body: `{ "participant": string }` (E.164 phone or Apple ID).
+
+Response: `{ "success": true, "data": { "chatId": "...", "participant": "+14155550100" } }`.
+
+## DELETE /v1/chats/:chatId/participants/:participantId
+
+Remove a participant by phone number or Apple ID. Fires `chat.participant.left`.
+
+```bash
+curl -X DELETE \
+  "https://api.textbubbles.com/v1/chats/iMessage%3B%2B%3Bchat1234567890/participants/+14155550100" \
+  -H "Authorization: Bearer YOUR_API_KEY"
+```
+
+Response: `{ "success": true, "data": { "chatId": "...", "removedParticipant": "+14155550100" } }`.
+
+## POST /v1/chats/:chatId/leave
+
+Leave a group chat.
+
+```bash
+curl -X POST https://api.textbubbles.com/v1/chats/iMessage%3B%2B%3Bchat1234567890/leave \
+  -H "Authorization: Bearer YOUR_API_KEY"
+```
+
+Response: `{ "success": true, "data": { "chatId": "...", "left": true } }`.
+
+## POST /v1/chats/:chatId/read
+
+iMessage only. Mark all messages in the chat as read. Returns 400 CHANNEL_NOT_SUPPORTED on WhatsApp chats — WhatsApp has no chat-level read ack; acknowledge per-message instead.
+
+```bash
+curl -X POST https://api.textbubbles.com/v1/chats/iMessage%3B%2B%3Bchat1234567890/read \
+  -H "Authorization: Bearer YOUR_API_KEY"
+```
+
+Response: `{ "success": true, "data": { "chatId": "...", "read": true } }`.
+
+## POST /v1/chats/:chatId/unread
+
+iMessage only. Set the unread indicator on the chat. Requires macOS 13 or later on the sender's instance. Returns 400 CHANNEL_NOT_SUPPORTED on WhatsApp chats.
+
+```bash
+curl -X POST https://api.textbubbles.com/v1/chats/iMessage%3B%2B%3Bchat1234567890/unread \
+  -H "Authorization: Bearer YOUR_API_KEY"
+```
+
+Response: `{ "success": true, "data": { "chatId": "...", "unread": true } }`.
+
+## POST /v1/chats/:chatId/typing
+
+Start or stop a typing indicator. Works on both iMessage and WhatsApp. On WhatsApp, "start" maps to the `composing` presence state and "stop" maps to `paused`.
+
+```bash
+curl -X POST https://api.textbubbles.com/v1/chats/iMessage%3B%2B%3Bchat1234567890/typing \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{ "status": "start" }'
+```
+
+Body: `{ "status": "start" | "stop" }`.
+
+Response: `{ "success": true, "data": { "chatId": "...", "typing": true } }`.
 
 ---
 
@@ -1810,13 +2123,14 @@ An instance can have multiple warnings at the same time. Warnings are cleared au
 | NO_DEFAULT_ADDRESS | 400 | No authorized address configured |
 | VALIDATION_ERROR | 400 | Request body failed validation |
 | INVALID_PHONE_NUMBER | 400 | Phone number not in E.164 format |
+| NAME_REQUIRED | 400 | POST /v1/chats/groups with channel: "whatsapp" and no name |
 | NOT_FOUND | 404 | Resource not found |
 | REPLY_NOT_FOUND | 404 | Reply target message not found |
-| CHANNEL_NOT_SUPPORTED | 400 | Operation not supported on channel |
+| CHANNEL_NOT_SUPPORTED | 400 | Operation not supported on the conversation's channel (e.g. /v1/chats/:chatId/read or /unread on a WhatsApp chat) |
 | NO_CHANNEL_AVAILABLE | 400 | Recipient not reachable |
-| FROM_INSTANCE_CANNOT_REACH | 400 | The specified `from` address cannot reach the recipient on any of the requested channels |
-| INVALID_RECIPIENT | 400 | Must provide exactly one of `to` or `conversationId` on send |
-| CONVERSATION_NOT_FOUND | 404 | `conversationId` does not match any conversation for this customer |
+| FROM_INSTANCE_CANNOT_REACH | 400 | The specified `from` address cannot reach the recipient on any of the requested channels, or — for `chatId` sends — does not match the instance the chat is pinned to |
+| INVALID_REQUEST | 400 | Request shape is invalid. On POST /v1/messages: `to` and `chatId` were both supplied, or neither was supplied (exactly one is required) |
+| CONVERSATION_NOT_FOUND | 404 | `chatId` does not match any conversation for this customer |
 | CONVERSATION_NOT_READY | 409 | Conversation has no provider chat yet; retry after the chat is created |
 | GROUP_SMS_UNSUPPORTED | 400 | Group send is not supported on SMS; send to participants individually |
 | INVALID_STATUS | 400 | Operation not valid for current status |
@@ -1857,6 +2171,17 @@ Base URL: https://api.textbubbles.com
 
 ## Capabilities
 - GET /v1/capabilities/:phone — Check iMessage/SMS/FaceTime support
+
+## Chats
+- POST /v1/chats/groups — Create a group chat (iMessage default; pass channel: "whatsapp" for a WA group — name is required)
+- GET /v1/chats/:chatId — Get chat info (participants, name, isGroup)
+- PUT /v1/chats/:chatId/name — Rename a group chat (iMessage + WhatsApp)
+- POST /v1/chats/:chatId/participants — Add a participant (iMessage + WhatsApp)
+- DELETE /v1/chats/:chatId/participants/:participantId — Remove a participant (iMessage + WhatsApp)
+- POST /v1/chats/:chatId/leave — Leave a group chat (iMessage + WhatsApp)
+- POST /v1/chats/:chatId/read — Mark a chat as read (iMessage only — 400 CHANNEL_NOT_SUPPORTED on WhatsApp)
+- POST /v1/chats/:chatId/unread — Mark a chat as unread (iMessage only — 400 CHANNEL_NOT_SUPPORTED on WhatsApp)
+- POST /v1/chats/:chatId/typing — Send a typing indicator (start/stop; iMessage + WhatsApp)
 
 ## Numbers
 - GET /v1/numbers — List available sender addresses
@@ -1970,7 +2295,7 @@ Inbound media (photos, videos, voice notes, documents, stickers) is surfaced as 
 Send-path error codes surface on the message as `errorCode` (GET /v1/messages/:id) and on message.failed webhook events.
 
 - NO_CHANNEL_AVAILABLE — none of the channels in routing.preference are available for this recipient (e.g. {"preference":["whatsapp"], "fallback":false} to a number not on WhatsApp). Include "imessage" or "sms" in the preference with fallback:true for graceful degradation.
-- FROM_INSTANCE_CANNOT_REACH — an explicit `from` was supplied and that specific sender cannot reach the recipient on any of the requested channels (e.g. the `from` number is not paired with WhatsApp). Pair the sender or pick a `from` that supports the channel.
+- FROM_INSTANCE_CANNOT_REACH — an explicit `from` was supplied and that specific sender cannot reach the recipient on any of the requested channels (e.g. the `from` number is not paired with WhatsApp), or — when sending with `chatId` — the `from` resolves to a different instance than the one the chat is pinned to. Pair the sender, pick a `from` that supports the channel, or omit `from` to let the chat's pinned instance handle delivery.
 - WHATSAPP_NOT_CONNECTED — no paired WhatsApp session for this number. Pair via Settings → WhatsApp in the textbubbles UI or the /v1/whatsapp/** API.
 - WHATSAPP_SEND_FAILED — generic send failure (transient upstream, unfetchable attachment URL, etc). Safe to retry.
 - WHATSAPP_MEDIA_TOO_LARGE — attachment exceeds WhatsApp's size limits (16 MB image / 64 MB video / 100 MB document)
@@ -1982,3 +2307,93 @@ Session-level disconnect reasons (surfaced on GET /v1/whatsapp/numbers/:phoneNum
 - phone_number_mismatch — the scanned account's number doesn't match the TextBubbles number this instance is registered to; auto-logged-out, re-pair with the correct account
 - auth_revoked — the customer removed the textbubbles link from WhatsApp → Linked Devices; re-enable for a fresh QR
 - close_<code> — transient close; the service reconnects automatically
+
+# WhatsApp Groups
+
+WhatsApp groups are managed through the same /v1/chats/* surface as iMessage groups. The Chats section above documents the full request/response shape; this section consolidates the WhatsApp-specific quirks.
+
+## Quirks
+
+- name is required on create. POST /v1/chats/groups with channel: "whatsapp" and no name returns 400 NAME_REQUIRED. WhatsApp groups must have a subject up-front.
+- No chat-level read ack. POST /v1/chats/:chatId/read and POST /v1/chats/:chatId/unread return 400 CHANNEL_NOT_SUPPORTED on WhatsApp chats. Acknowledge reads per-message instead.
+- LID vs PN participants. A participant may have handle ending in `@lid` (Linked Device ID) when their phone number is not yet known. Use isPhoneResolved: true|false as the source of truth — do not parse the handle suffix. isPhoneResolved appears in (a) participants[] in REST responses for WhatsApp chats and (b) conversation.participants[] in webhook payloads for events attributed to a WhatsApp group.
+- chatId format: WhatsApp groups are `<id>@g.us`. iMessage groups are `iMessage;+;<guid>`. conversationId (UUID) is the same shape on both channels and is the stable identifier.
+- from on create: when supplied, the group is created from that specific instance and the conversation is pinned to it. Without from, the customer's default WhatsApp instance is used.
+- Typing: POST /v1/chats/:chatId/typing works on WhatsApp. "start" maps to the `composing` presence state; "stop" maps to `paused`.
+
+## Create
+
+```bash
+curl -X POST https://api.textbubbles.com/v1/chats/groups \
+  -H "Authorization: Bearer $TB_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "channel": "whatsapp",
+    "name": "Launch Team",
+    "participants": ["+14155551234", "+14155559876"]
+  }'
+```
+
+Response data shape:
+
+```json
+{
+  "chatId": "120363025123456789@g.us",
+  "conversationId": "550e8400-e29b-41d4-a716-446655440000",
+  "channel": "whatsapp",
+  "name": "Launch Team",
+  "participants": [
+    { "handle": "14155551234@s.whatsapp.net", "isPhoneResolved": true, "admin": null }
+  ],
+  "createdAt": "2026-05-25T17:00:00.000Z"
+}
+```
+
+## Rename / add / remove / leave / typing
+
+```bash
+# Rename
+curl -X PUT "https://api.textbubbles.com/v1/chats/120363025123456789@g.us/name" \
+  -H "Authorization: Bearer $TB_KEY" -H "Content-Type: application/json" \
+  -d '{ "name": "Launch Team — Q3" }'
+
+# Add participant
+curl -X POST "https://api.textbubbles.com/v1/chats/120363025123456789@g.us/participants" \
+  -H "Authorization: Bearer $TB_KEY" -H "Content-Type: application/json" \
+  -d '{ "participant": "+14155550100" }'
+
+# Remove participant
+curl -X DELETE "https://api.textbubbles.com/v1/chats/120363025123456789@g.us/participants/+14155550100" \
+  -H "Authorization: Bearer $TB_KEY"
+
+# Leave
+curl -X POST "https://api.textbubbles.com/v1/chats/120363025123456789@g.us/leave" \
+  -H "Authorization: Bearer $TB_KEY"
+
+# Typing
+curl -X POST "https://api.textbubbles.com/v1/chats/120363025123456789@g.us/typing" \
+  -H "Authorization: Bearer $TB_KEY" -H "Content-Type: application/json" \
+  -d '{ "status": "start" }'
+```
+
+## Webhook idempotency
+
+chat.title.changed, chat.participant.added, and chat.participant.left can fire from two paths: a customer-initiated REST call, and a provider state-change event observed shortly after. For changes initiated through /v1/chats/*, the webhook is emitted exactly once within a 60-second dedup window. Implement handlers to be idempotent on `eventId` regardless.
+
+## Participant fields (WhatsApp)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| handle | string | Phone JID (`<digits>@s.whatsapp.net`) when known, or `<id>@lid` when only the Linked Device ID is known |
+| isPhoneResolved | boolean | true when handle is phone-based, false when handle is a `@lid` |
+| admin | string \| null | "admin", "superadmin", or null |
+
+## Error codes (WhatsApp group operations)
+
+| Code | HTTP | When |
+|------|------|------|
+| NAME_REQUIRED | 400 | POST /v1/chats/groups (channel: "whatsapp") with missing/empty name |
+| CHANNEL_NOT_SUPPORTED | 400 | POST /v1/chats/:chatId/read or /unread on a WhatsApp chat |
+| FROM_INSTANCE_CANNOT_REACH | 400 | Supplied `from` does not match the instance the conversation is pinned to |
+| CONVERSATION_NOT_FOUND | 404 | chatId does not match any conversation for this customer |
+| WHATSAPP_NOT_CONNECTED | 400 | The pinned WhatsApp instance is not currently paired |
