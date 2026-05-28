@@ -44,7 +44,7 @@ curl -X POST https://api.textbubbles.com/v1/messages \
 ## Endpoint Summary
 
 ### Messages
-- POST /v1/messages — Send a message (text, attachments, carousels, effects, scheduled); pass `chatId` instead of `to` to send into an existing chat
+- POST /v1/messages — Send a message (text, attachments, carousels, effects, scheduled); pass `chatId` (or its alias `conversationId`) instead of `to` to send into an existing chat
 - GET /v1/messages — List messages
 - GET /v1/messages/:id — Get message status
 - POST /v1/messages/:id/unsend — Unsend (iMessage only)
@@ -73,7 +73,7 @@ curl -X POST https://api.textbubbles.com/v1/messages \
 - CHANNEL_NOT_SUPPORTED (400) — operation not available on the conversation's channel
 
 ### Webhook Events (selected)
-- message.inbound, message.sent, message.delivered, message.read, message.failed — include `chat` and `sender` fragments when attributed to a known chat
+- message.inbound, message.sent, message.delivered, message.read, message.failed — include `chat` and `sender` fragments when attributed to a known chat. `chat` also ships under the legacy alias `conversation` (`id`/`groupName` field names) on the same payloads.
 - chat.participant.added, chat.participant.left, chat.title.changed, chat.photo.changed — emitted when iMessage group state changes
 
 ### Numbers
